@@ -325,19 +325,19 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
+        className: 'w-7 justify-center px-0',
+        icon: <Codicon name="map" size="0.875rem" />,
+        id: 'learning',
+        title: copy.openLearning,
+        to: LEARNING_ROUTE,
+        variant: 'action'
+      },
+      {
         icon: <Clock className="size-3" />,
         id: 'cron',
         label: copy.cron,
         title: copy.openCron,
         to: CRON_ROUTE,
-        variant: 'action'
-      },
-      {
-        icon: <Codicon name="type-hierarchy" size="0.75rem" />,
-        id: 'learning',
-        label: copy.learning,
-        title: copy.openLearning,
-        to: LEARNING_ROUTE,
         variant: 'action'
       }
     ],

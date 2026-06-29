@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
+import { createDoubleTapDetector, isSmartZoomWheel } from '@/lib/trackpad-gestures'
 import { $learningError, $learningGraph, $learningLoading, loadLearningGraph } from '@/store/learning'
 import type { LearningGraph, LearningNode } from '@/types/hermes'
 
@@ -25,7 +26,7 @@ import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
 // hot while old ones cool toward the core. Hover lights a constellation and
 // shows a dated tooltip; click locks focus. Canvas-rendered. No modes.
 
-const RING_INNER = 78
+const RING_INNER = 48
 const RING_OUTER = 340
 const ZOOM_MIN = 0.3
 const ZOOM_MAX = 5
@@ -50,6 +51,33 @@ interface SimLink extends SimulationLinkDatum<SimNode> {
   target: SimNode | string
 }
 
+interface Rgb {
+  b: number
+  g: number
+  r: number
+}
+
+// Fixed recency (age) gradient — old content quiet, recent content bright.
+const AGE_GRADIENT = { mid: 0.52, midInk: 0.62, newInk: 0.82, oldInk: 0.24, reach: 1 }
+
+// Per-mode line/ring defaults (curated). The controls seed from the active
+// theme and reset to its set on toggle.
+interface GraphParams {
+  lineAlpha: number
+  lineDash: number
+  lineDashed: boolean
+  lineWidth: number
+  ringAlpha: number
+  ringDash: number
+  ringDashed: boolean
+  ringWidth: number
+}
+
+const MODE_DEFAULTS: Record<'dark' | 'light', GraphParams> = {
+  dark: { lineAlpha: 0.16, lineDash: 1, lineDashed: true, lineWidth: 0.5, ringAlpha: 0.1, ringDash: 4, ringDashed: false, ringWidth: 1.5 },
+  light: { lineAlpha: 0.18, lineDash: 1, lineDashed: true, lineWidth: 0.5, ringAlpha: 0.06, ringDash: 4, ringDashed: false, ringWidth: 2 }
+}
+
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
@@ -65,17 +93,16 @@ function hash(input: string): number {
   return h >>> 0
 }
 
-// Monotone, theme-driven palette: every shade is derived from the theme's
-// `foreground` color (read off the canvas at draw time), so the map is a single
-// ink on the overlay and adapts to light/dark. Recency is conveyed by opacity,
-// memory vs skill by shape — no hues.
+// Theme-driven palette: structure stays close to foreground ink, while node
+// groups borrow subtle color from the active desktop theme. Recency is conveyed
+// by opacity; memory vs skill is shape + restrained theme tint.
 //
 // Theme tokens come through `color-mix()`/oklch, so getComputedStyle returns a
 // non-rgb() string. Rasterize it through a 1x1 canvas to get real sRGB bytes —
 // naive string parsing of oklab()/color(srgb …) silently yields black.
 let _probe: CanvasRenderingContext2D | null = null
 
-function resolveRgb(color: string): { b: number; g: number; r: number } {
+function resolveRgb(color: string): Rgb {
   if (!_probe) {
     const c = document.createElement('canvas')
     c.width = 1
@@ -94,6 +121,20 @@ function resolveRgb(color: string): { b: number; g: number; r: number } {
   const d = _probe.getImageData(0, 0, 1, 1).data
 
   return { b: d[2], g: d[1], r: d[0] }
+}
+
+function rgba(c: Rgb, a: number): string {
+  return `rgba(${c.r},${c.g},${c.b},${a})`
+}
+
+function mixRgb(a: Rgb, b: Rgb, t: number): Rgb {
+  const p = clamp(t, 0, 1)
+
+  return {
+    b: Math.round(a.b + (b.b - a.b) * p),
+    g: Math.round(a.g + (b.g - a.g) * p),
+    r: Math.round(a.r + (b.r - a.r) * p)
+  }
 }
 
 function luminance(r: number, g: number, b: number): number {
@@ -208,6 +249,14 @@ function StarMap({ graph }: { graph: LearningGraph }) {
   const ringLabelRectsRef = useRef<Array<{ h: number; i: number; w: number; x: number; y: number }>>([])
   const starsRef = useRef<Array<{ a: number; r: number; x: number; y: number }>>([])
 
+  const fadeRef = useRef({
+    labels: new Map<string, number>(),
+    links: new Map<string, number>(),
+    nodes: new Map<string, number>(),
+    rings: new Map<string, number>()
+  })
+
+  const doubleTapRef = useRef(createDoubleTapDetector())
   const viewportRef = useRef<Viewport>({ k: 1, x: 0, y: 0 })
   const hoverRef = useRef<null | string>(null)
   const hoveredRingRef = useRef<null | number>(null)
@@ -359,6 +408,10 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     linksRef.current = links
     byIdRef.current = byId
     ringsRef.current = rings
+    fadeRef.current.labels.clear()
+    fadeRef.current.links.clear()
+    fadeRef.current.nodes.clear()
+    fadeRef.current.rings.clear()
     viewportRef.current = fitViewport(size.w, size.h)
     dirtyRef.current = true
 
@@ -423,7 +476,10 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     const loop = () => {
       if (dirtyRef.current) {
         dirtyRef.current = false
-        draw()
+
+        if (draw()) {
+          dirtyRef.current = true
+        }
       }
 
       raf = requestAnimationFrame(loop)
@@ -434,7 +490,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       const ctx = canvas?.getContext('2d')
 
       if (!canvas || !ctx) {
-        return
+        return false
       }
 
       const { h, w } = sizeRef.current
@@ -443,6 +499,34 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       const nodes = nodesRef.current
       const byId = byIdRef.current
       const adj = adjacencyRef.current
+      const fades = fadeRef.current
+      let animating = false
+
+      const fadeAlpha = (bucket: Map<string, number>, key: string, target: number, snapUp = false) => {
+        const targetAlpha = clamp(target, 0, 1)
+        const prev = bucket.get(key)
+
+        if (prev == null || (snapUp && targetAlpha > prev)) {
+          bucket.set(key, targetAlpha)
+
+          return targetAlpha
+        }
+
+        const rate = targetAlpha > prev ? 0.08 : 0.32
+        const next = prev + (targetAlpha - prev) * rate
+
+        if (Math.abs(next - targetAlpha) < 0.01) {
+          bucket.set(key, targetAlpha)
+
+          return targetAlpha
+        }
+
+        animating = true
+        bucket.set(key, next)
+
+        return next
+      }
+
       // Unified focus precedence (nodes and rings behave 1:1): a SELECTED item
       // locks the view; hover only applies when nothing is selected; node-focus
       // and ring-focus are mutually exclusive, so hovering one kind while the
@@ -466,15 +550,55 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       const projX = (wx: number) => wx * vp.k + vp.x
       const projY = (wy: number) => wy * vp.k * TILT + vp.y
 
-      // Stark monotone: pure white ink on dark, pure black on light. The theme
-      // foreground is only used to detect which mode we're in.
-      const fg = resolveRgb(getComputedStyle(canvas).color)
+      // Structure stays pure foreground; node/route accents derive from the
+      // active desktop theme.
+      const style = getComputedStyle(canvas)
+      const fg = resolveRgb(style.color)
       const darkTheme = luminance(fg.r, fg.g, fg.b) > 0.55
       const base = darkTheme ? { b: 255, g: 255, r: 255 } : { b: 0, g: 0, r: 0 }
       const shade = (a: number) => `rgba(${base.r},${base.g},${base.b},${a})`
+      const c = MODE_DEFAULTS[darkTheme ? 'dark' : 'light']
+
+      const primary = resolveRgb(style.getPropertyValue('--theme-primary').trim() || style.color)
+
+      const secondary = resolveRgb(
+        style.getPropertyValue('--theme-secondary').trim() ||
+          style.getPropertyValue('--theme-midground').trim() ||
+          style.color
+      )
+
+      const skillInk = mixRgb(primary, base, darkTheme ? 0.12 : 0.18)
+      const memoryInk = mixRgb(secondary, base, darkTheme ? 0.08 : 0.14)
       const chipBg = darkTheme ? 'rgba(0,0,0,0.72)' : 'rgba(255,255,255,0.85)'
+
+      // Actual overlay surface color — used as a label backdrop so text stays
+      // legible over rings/links without a stark black/white halo.
+      const bg = resolveRgb(
+        style.getPropertyValue('--background').trim() ||
+          style.getPropertyValue('--dt-background').trim() ||
+          (darkTheme ? '#000' : '#fff')
+      )
+
       // Inverted ink (background color) for the flipped focused tooltip.
       const inkInv = darkTheme ? 'rgba(0,0,0,1)' : 'rgba(255,255,255,1)'
+
+      const recencyInk = (rec: number) => {
+        const reach = Math.max(0.01, AGE_GRADIENT.reach)
+        const mid = clamp(AGE_GRADIENT.mid, 0.01, 0.99)
+        const t = clamp(rec / reach, 0, 1)
+
+        if (t <= mid) {
+          const p = t / mid
+          const eased = p * p * (3 - 2 * p)
+
+          return AGE_GRADIENT.oldInk + (AGE_GRADIENT.midInk - AGE_GRADIENT.oldInk) * eased
+        }
+
+        const p = (t - mid) / (1 - mid)
+        const eased = p * p * (3 - 2 * p)
+
+        return AGE_GRADIENT.midInk + (AGE_GRADIENT.newInk - AGE_GRADIENT.midInk) * eased
+      }
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       ctx.clearRect(0, 0, w, h)
@@ -494,37 +618,20 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       // Tilted world transform for the disk structure + jump routes.
       ctx.setTransform(vp.k * dpr, 0, 0, vp.k * TILT * dpr, vp.x * dpr, vp.y * dpr)
 
-      const coreGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, RING_INNER * 1.5)
-      coreGrad.addColorStop(0, shade(0.05))
-      coreGrad.addColorStop(0.5, shade(0.02))
-      coreGrad.addColorStop(1, shade(0))
-      ctx.fillStyle = coreGrad
-      ctx.beginPath()
-      ctx.arc(0, 0, RING_INNER * 1.5, 0, Math.PI * 2)
-      ctx.fill()
-
       const ringIdx = focusRing
       const ring = ringIdx != null ? (ringsRef.current[ringIdx] ?? null) : null
       const active = !!focus || !!ring
-      ctx.lineWidth = 1 / vp.k
-      ctx.setLineDash([6 / vp.k, 5 / vp.k])
+      ctx.lineWidth = c.ringWidth / vp.k
+      ctx.setLineDash(c.ringDashed ? [c.ringDash / vp.k, c.ringDash / vp.k] : [])
       ringsRef.current.forEach((rg, i) => {
-        ctx.strokeStyle = shade(ringIdx === i ? 0.5 : active ? 0.24 : darkTheme ? 0.16 : 0.1)
+        // Idle alpha is the slider; focus/hover derive emphasis from it.
+        const targetAlpha = ringIdx === i ? clamp(c.ringAlpha + 0.3, 0, 1) : active ? clamp(c.ringAlpha + 0.1, 0, 1) : c.ringAlpha
+        ctx.strokeStyle = shade(fadeAlpha(fades.rings, String(i), targetAlpha, ringIdx === i))
         ctx.beginPath()
         ctx.arc(0, 0, rg.r, 0, Math.PI * 2)
         ctx.stroke()
       })
       ctx.setLineDash([])
-      ctx.strokeStyle = shade(active ? 0.13 : darkTheme ? 0.08 : 0.05)
-
-      for (let i = 0; i < 6; i += 1) {
-        const a = (i / 6) * Math.PI * 2
-        ctx.beginPath()
-        ctx.moveTo(Math.cos(a) * RING_INNER, Math.sin(a) * RING_INNER)
-        ctx.lineTo(Math.cos(a) * RING_OUTER, Math.sin(a) * RING_OUTER)
-        ctx.stroke()
-      }
-
       // Switch to screen space for jump routes + glyphs (crisp, easy to trim).
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
@@ -561,29 +668,40 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           y2 += ((y1 - y2) / d) * focusRingR
         }
 
-        ctx.strokeStyle = lit ? shade(0.72) : shade(darkTheme ? 0.17 : 0.1)
-        ctx.lineWidth = lit ? 1.6 : 0.85
+        // Ambient links follow the recency slope; focused routes ignore age so
+        // selection stays readable.
+        const ageInk = recencyInk((s.rec + t.rec) / 2)
+        // Ambient alpha is the slider (aged down); focused routes get emphasis.
+        const targetAlpha = lit ? clamp(c.lineAlpha + 0.45, 0, 1) : focus || ring ? 0.025 : ageInk * c.lineAlpha
+        const linkAlpha = fadeAlpha(fades.links, `${s.id}->${t.id}`, targetAlpha, lit)
+        ctx.strokeStyle = shade(linkAlpha)
+        ctx.setLineDash(c.lineDashed ? [c.lineDash, c.lineDash] : [])
+        ctx.lineWidth = c.lineWidth
         ctx.beginPath()
         ctx.moveTo(x1, y1)
         ctx.lineTo(x2, y2)
         ctx.stroke()
       }
 
-      // Systems (nodes): opacity encodes recency — newest fully opaque, oldest
-      // faded toward a floor (eased), with a slight size bump for recent ones.
-      ctx.fillStyle = shade(1)
+      ctx.setLineDash([])
 
+      // Systems (nodes): newest stays full ink, older content fades through the
+      // same smooth slope as links. Size still encodes usage/state.
       for (const n of nodes) {
-        const r = (nodeRadius(n) + n.rec) * vp.k
         const isFocus = n.id === focus
         const isNeighbor = !!focusSet && focusSet.has(n.id)
         const inRing = !!ring && Math.abs(n.rec - ring.ratio) <= 0.13
         const dim = focus ? !isFocus && !isNeighbor : ring ? !inRing : false
+        const ageInk = recencyInk(n.rec)
+        const ageScale = isFocus || isNeighbor || inRing ? 1 : 0.34 + Math.min(1, n.rec / 0.4) * 0.66
+        const r = nodeRadius(n) * vp.k * ageScale
         const sx = projX(n.x)
         const sy = projY(n.y)
 
-        const recAlpha = 0.35 + 0.65 * (1 - (1 - n.rec) ** 3)
-        ctx.globalAlpha = dim ? 0.16 : isFocus ? 1 : recAlpha
+        const targetAlpha = dim ? 0.16 : isFocus || isNeighbor || inRing ? 1 : ageInk
+        ctx.globalAlpha = fadeAlpha(fades.nodes, n.id, targetAlpha, isFocus || isNeighbor || inRing)
+        const nodeInk = n.kind === 'memory' ? memoryInk : skillInk
+        ctx.fillStyle = rgba(nodeInk, 1)
 
         if (n.kind === 'memory') {
           ctx.beginPath()
@@ -601,7 +719,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
         if (isFocus) {
           ctx.globalAlpha = 1
-          ctx.strokeStyle = shade(1)
+          ctx.strokeStyle = rgba(nodeInk, 1)
           ctx.lineWidth = 1.4
           ctx.beginPath()
           ctx.arc(sx, sy, r + 4, 0, Math.PI * 2)
@@ -610,6 +728,8 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       }
 
       ctx.globalAlpha = 1
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
       // Ring date labels (top of each ellipse) — hoverable to focus the ring.
       ctx.font = '10px ui-sans-serif, system-ui, sans-serif'
@@ -633,13 +753,12 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         // label and bg together.
         const isThis = ringIdx === i
         const faded = (focus != null || ringIdx != null) && !isThis
-        // EVE-style: labels float in space (no chip). A bg-colored halo keeps
-        // them legible over rings/links; everything stays stark monotone.
-        ctx.globalAlpha = faded ? 0.33 : 1
-        ctx.lineJoin = 'round'
-        ctx.lineWidth = 3
-        ctx.strokeStyle = inkInv
-        ctx.strokeText(rg.label, sx, sy + 3)
+        // EVE-style: labels float in space (no chip). A solid backdrop in the
+        // overlay's own background color masks the ring line behind the text so
+        // it stays legible — a real backdrop, not a stark black/white halo.
+        ctx.globalAlpha = fadeAlpha(fades.labels, String(i), faded ? 0.33 : 1, isThis)
+        ctx.fillStyle = rgba(bg, 1)
+        ctx.fillRect(sx - boxW / 2, sy - 6, boxW, 13)
         ctx.fillStyle = shade(isThis ? 1 : 0.55)
         ctx.fillText(rg.label, sx, sy + 3)
         ctx.globalAlpha = 1
@@ -768,6 +887,8 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
         ctx.textBaseline = 'alphabetic'
       }
+
+      return animating
     }
 
     raf = requestAnimationFrame(loop)
@@ -891,6 +1012,15 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
     // A click (press without movement) selects a ring date, a node, or clears.
     if (drag.mode === 'pan' && !drag.moved) {
+      // Double tap (trackpad tap-to-click may never emit a dblclick) resets view.
+      if (doubleTapRef.current()) {
+        resetView()
+
+        dragRef.current = { id: null, mode: 'none', moved: false, ring: null, sx: 0, sy: 0, vp: viewportRef.current }
+
+        return
+      }
+
       if (drag.ring != null) {
         selectedRingRef.current = selectedRingRef.current === drag.ring ? null : drag.ring
         setSelectedId(null)
@@ -919,6 +1049,14 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     const rect = canvasRef.current?.getBoundingClientRect()
 
     if (!rect) {
+      return
+    }
+
+    // macOS "smart zoom" (two-finger double-tap) reaches us as a ctrl-wheel with
+    // zero deltas (see lib/trackpad-gestures). Use it to reset the view.
+    if (isSmartZoomWheel(e)) {
+      resetView()
+
       return
     }
 
@@ -953,10 +1091,10 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       <div className="pointer-events-none absolute left-2 top-2 flex flex-col gap-1 bg-background/40 px-2 py-1.5 text-[0.62rem] text-muted-foreground backdrop-blur-sm">
         <div className="flex items-center gap-3">
           <span className="flex items-center gap-1">
-            <span className="inline-block size-2 rounded-full bg-foreground/70" /> skill
+            <span className="inline-block size-2 rounded-full bg-[var(--theme-primary)]/80" /> skill
           </span>
           <span className="flex items-center gap-1">
-            <span className="inline-block size-2 rotate-45 bg-foreground/70" /> memory
+            <span className="inline-block size-2 rotate-45 bg-[var(--theme-secondary)]/80" /> memory
           </span>
         </div>
         <div className="text-[0.58rem] text-muted-foreground/65">core = oldest · outer rings = newer</div>
