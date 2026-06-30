@@ -15,7 +15,7 @@ export const WHITE: Rgb = { b: 255, g: 255, r: 255 }
 export const BLACK: Rgb = { b: 0, g: 0, r: 0 }
 
 // Fixed recency (age) gradient — old content quiet, recent content bright.
-export const AGE_GRADIENT = { mid: 0.52, midInk: 0.62, newInk: 0.82, oldInk: 0.24, reach: 1 }
+export const AGE_GRADIENT = { mid: 0.52, midInk: 0.74, newInk: 0.95, oldInk: 0.42, reach: 1 }
 
 // Node glyph per kind — pure path geometry (the seam a future sprite/instanced
 // renderer would bake from).
