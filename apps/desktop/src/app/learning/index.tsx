@@ -9,7 +9,7 @@ import {
   type SimulationLinkDatum,
   type SimulationNodeDatum
 } from 'd3-force'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
@@ -57,6 +57,13 @@ interface Rgb {
   r: number
 }
 
+interface Rect {
+  h: number
+  w: number
+  x: number
+  y: number
+}
+
 // Fixed recency (age) gradient — old content quiet, recent content bright.
 const AGE_GRADIENT = { mid: 0.52, midInk: 0.62, newInk: 0.82, oldInk: 0.24, reach: 1 }
 
@@ -74,8 +81,26 @@ interface GraphParams {
 }
 
 const MODE_DEFAULTS: Record<'dark' | 'light', GraphParams> = {
-  dark: { lineAlpha: 0.16, lineDash: 1, lineDashed: true, lineWidth: 0.5, ringAlpha: 0.1, ringDash: 4, ringDashed: false, ringWidth: 1.5 },
-  light: { lineAlpha: 0.18, lineDash: 1, lineDashed: true, lineWidth: 0.5, ringAlpha: 0.06, ringDash: 4, ringDashed: false, ringWidth: 2 }
+  dark: {
+    lineAlpha: 0.16,
+    lineDash: 1,
+    lineDashed: true,
+    lineWidth: 0.5,
+    ringAlpha: 0.1,
+    ringDash: 4,
+    ringDashed: false,
+    ringWidth: 1.5
+  },
+  light: {
+    lineAlpha: 0.18,
+    lineDash: 1,
+    lineDashed: true,
+    lineWidth: 0.5,
+    ringAlpha: 0.06,
+    ringDash: 4,
+    ringDashed: false,
+    ringWidth: 2
+  }
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -141,6 +166,54 @@ function luminance(r: number, g: number, b: number): number {
   return (0.2126 * r + 0.7152 * g + 0.114 * b) / 255
 }
 
+interface Palette {
+  base: Rgb
+  bandInk: Rgb
+  bg: Rgb
+  c: GraphParams
+  chipBg: string
+  darkTheme: boolean
+  inkInv: string
+  memoryInk: Rgb
+  skillInk: Rgb
+}
+
+// Resolve the theme-derived palette once per theme change — the resolveRgb
+// probe does a getImageData readback, so this stays out of the per-frame path.
+function computePalette(canvas: HTMLCanvasElement): Palette {
+  const style = getComputedStyle(canvas)
+  const fg = resolveRgb(style.color)
+  const darkTheme = luminance(fg.r, fg.g, fg.b) > 0.55
+  const base: Rgb = darkTheme ? { b: 255, g: 255, r: 255 } : { b: 0, g: 0, r: 0 }
+  const primary = resolveRgb(style.getPropertyValue('--theme-primary').trim() || style.color)
+
+  const secondary = resolveRgb(
+    style.getPropertyValue('--theme-secondary').trim() ||
+      style.getPropertyValue('--theme-midground').trim() ||
+      style.color
+  )
+
+  const bg = resolveRgb(
+    style.getPropertyValue('--background').trim() ||
+      style.getPropertyValue('--dt-background').trim() ||
+      (darkTheme ? '#000' : '#fff')
+  )
+
+  return {
+    // Band tint derives from the theme primary so the rings read consistently
+    // in both modes (foreground ink would go white on dark / black on light).
+    bandInk: mixRgb(primary, base, darkTheme ? 0.3 : 0),
+    base,
+    bg,
+    c: MODE_DEFAULTS[darkTheme ? 'dark' : 'light'],
+    chipBg: darkTheme ? 'rgba(0,0,0,0.72)' : 'rgba(255,255,255,0.85)',
+    darkTheme,
+    inkInv: darkTheme ? 'rgba(0,0,0,1)' : 'rgba(255,255,255,1)',
+    memoryInk: mixRgb(secondary, base, darkTheme ? 0.08 : 0.14),
+    skillInk: mixRgb(primary, base, darkTheme ? 0.12 : 0.18)
+  }
+}
+
 function nodeRadius(n: LearningNode): number {
   if (n.kind === 'memory') {
     return 4.4
@@ -149,6 +222,111 @@ function nodeRadius(n: LearningNode): number {
   const base = n.state === 'archived' || n.state === 'stale' ? 2.4 : 3
 
   return base + Math.sqrt(Math.max(0, n.useCount)) * 0.55 + (n.pinned ? 0.8 : 0)
+}
+
+// Node glyphs — pure path geometry (the seam a future sprite/instanced renderer
+// would bake from).
+type Shape = 'circle' | 'diamond' | 'hexagon' | 'square' | 'triangle'
+
+const NODE_SHAPE: Record<LearningNode['kind'], Shape> = { memory: 'diamond', skill: 'circle' }
+
+const WHITE: Rgb = { b: 255, g: 255, r: 255 }
+const BLACK: Rgb = { b: 0, g: 0, r: 0 }
+
+// Darken the orb body so a bright primary doesn't swallow the sheen (the
+// highlight is computed from the original ink, so it still reads). Tweak.
+const ORB_DARKEN = 0.3
+
+// Sheen forced this high when the orb ink is near-white (a white body needs a
+// pure-white core to read as a sphere at all).
+const WHITEISH_SHEEN = 0.95
+
+interface RingParams {
+  bandAlpha: number
+  lightSize: number
+  ringAlpha: number
+  sheen: number
+}
+
+// Per-mode ring/orb params (band wash, light sliver size, ring outline alpha,
+// orb sheen). Curated; the renderer picks the set by active theme.
+const RING_PARAMS: Record<'dark' | 'light', RingParams> = {
+  dark: { bandAlpha: 0.01, lightSize: 0.64, ringAlpha: 0.03, sheen: 0.12 },
+  light: { bandAlpha: 0.03, lightSize: 0.27, ringAlpha: 0.04, sheen: 0.1 }
+}
+
+// Flat wash alpha for a lit (hovered/selected) date's band. The focused ring
+// outline derives from this (×2).
+const LIT_BAND_ALPHA = 0.04
+
+function darken(c: Rgb, amount: number): Rgb {
+  return mixRgb(c, BLACK, amount)
+}
+
+// Fill the current path as a lit sphere: an offset radial gradient from a hot
+// core → darkened body → translucent rim, so a flat circle reads with volume.
+// `strength` controls how white the core highlight is; `bodyDarken` darkens the
+// body (0 for active/hover nodes, so they pop full bright like before).
+function sphereFill(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  r: number,
+  ink: Rgb,
+  strength: number,
+  bodyDarken: number
+): void {
+  // Darkening a near-white ink just greys it out (cringe). Detect whiteness
+  // (bright + desaturated): skip the darken AND force a near-full sheen so the
+  // white core still reads against the off-white body.
+  const mx = Math.max(ink.r, ink.g, ink.b)
+  const mn = Math.min(ink.r, ink.g, ink.b)
+  const sat = mx ? (mx - mn) / mx : 0
+  const whiteness = clamp((luminance(ink.r, ink.g, ink.b) - 0.7) / 0.3, 0, 1) * (1 - sat)
+  const eff = strength + (WHITEISH_SHEEN - strength) * whiteness
+  const hi = mixRgb(ink, WHITE, 0.7 * eff)
+  const body = darken(ink, bodyDarken * (1 - whiteness))
+  const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.05, x, y, r * 1.15)
+  g.addColorStop(0, rgba(hi, 1))
+  g.addColorStop(0.5, rgba(body, 1))
+  g.addColorStop(1, rgba(body, 0.85))
+  ctx.fillStyle = g
+  ctx.fill()
+}
+
+// Trace a centred geometric shape of radius r into the current path.
+function shapePath(ctx: CanvasRenderingContext2D, shape: Shape, x: number, y: number, r: number): void {
+  ctx.beginPath()
+
+  if (shape === 'square') {
+    ctx.rect(x - r, y - r, r * 2, r * 2)
+
+    return
+  }
+
+  if (shape === 'circle') {
+    ctx.arc(x, y, r, 0, Math.PI * 2)
+
+    return
+  }
+
+  const pts = shape === 'diamond' ? 4 : shape === 'triangle' ? 3 : 6
+  // Diamond/triangle point up; hexagon is flat-topped.
+  const rot = shape === 'hexagon' ? Math.PI / 6 : -Math.PI / 2
+
+  for (let i = 0; i < pts; i += 1) {
+    const a = rot + (i / pts) * Math.PI * 2
+    const px = x + Math.cos(a) * r
+    const py = y + Math.sin(a) * r
+
+    if (i === 0) {
+      ctx.moveTo(px, py)
+    } else {
+      ctx.lineTo(px, py)
+    }
+  }
+
+  ctx.closePath()
 }
 
 function formatDate(ts?: null | number): string {
@@ -223,6 +401,22 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxW: number): st
   return lines
 }
 
+// Trim to fit maxW, appending an ellipsis (keeps floating labels compact so
+// they don't span the overlay).
+function ellipsize(ctx: CanvasRenderingContext2D, text: string, maxW: number): string {
+  if (ctx.measureText(text).width <= maxW) {
+    return text
+  }
+
+  let s = text
+
+  while (s.length > 1 && ctx.measureText(`${s}…`).width > maxW) {
+    s = s.slice(0, -1)
+  }
+
+  return `${s.trimEnd()}…`
+}
+
 function fitViewport(w: number, h: number): Viewport {
   if (w <= 0 || h <= 0) {
     return { k: 1, x: w / 2, y: h / 2 }
@@ -257,6 +451,9 @@ function StarMap({ graph }: { graph: LearningGraph }) {
   })
 
   const doubleTapRef = useRef(createDoubleTapDetector())
+  const paletteRef = useRef<null | Palette>(null)
+  const themeDirtyRef = useRef(true)
+  const invalidateRef = useRef<() => void>(() => {})
   const viewportRef = useRef<Viewport>({ k: 1, x: 0, y: 0 })
   const hoverRef = useRef<null | string>(null)
   const hoveredRingRef = useRef<null | number>(null)
@@ -279,6 +476,9 @@ function StarMap({ graph }: { graph: LearningGraph }) {
   const [selectedId, setSelectedId] = useState<null | string>(null)
   const [size, setSize] = useState({ h: 0, w: 0 })
   const loading = useStore($learningLoading)
+
+  // Mark the canvas dirty and wake the (otherwise-idle) render loop.
+  const invalidate = useCallback(() => invalidateRef.current(), [])
 
   const memById = useMemo(() => {
     const m = new Map<string, LearningGraph['memory'][number]>()
@@ -386,9 +586,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           .iterations(2)
       )
       .force('radial', forceRadial<SimNode>(n => (n as SimNode).tr, 0, 0).strength(0.92))
-      .on('tick', () => {
-        dirtyRef.current = true
-      })
+      .on('tick', invalidate)
 
     const rings: Array<{ label: null | string; r: number; ratio: number }> = []
     const steps = 4
@@ -413,7 +611,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     fadeRef.current.nodes.clear()
     fadeRef.current.rings.clear()
     viewportRef.current = fitViewport(size.w, size.h)
-    dirtyRef.current = true
+    invalidate()
 
     if (selectedIdRef.current && !byId.has(selectedIdRef.current)) {
       selectedIdRef.current = null
@@ -427,7 +625,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         simRef.current = null
       }
     }
-  }, [graph.edges, graph.nodes, size])
+  }, [graph.edges, graph.nodes, invalidate, size])
 
   useEffect(() => {
     const count = clamp(Math.round((size.w * size.h) / 8000), 50, 200)
@@ -441,24 +639,25 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         y: (s >>> 12) % Math.max(1, size.h)
       }
     })
-    dirtyRef.current = true
-  }, [size])
+    invalidate()
+  }, [invalidate, size])
 
   useEffect(() => {
     adjacencyRef.current = adjacency
     memByIdRef.current = memById
-    dirtyRef.current = true
-  }, [adjacency, memById])
+    invalidate()
+  }, [adjacency, invalidate, memById])
 
   useEffect(() => {
     selectedIdRef.current = selectedId
-    dirtyRef.current = true
-  }, [selectedId])
+    invalidate()
+  }, [invalidate, selectedId])
 
-  // Repaint when the theme/mode changes (toggles class + inline vars on <html>).
+  // Repaint + repalette when the theme/mode changes (class + inline vars on <html>).
   useEffect(() => {
     const mo = new MutationObserver(() => {
-      dirtyRef.current = true
+      themeDirtyRef.current = true
+      invalidate()
     })
 
     mo.observe(document.documentElement, {
@@ -467,22 +666,39 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     })
 
     return () => mo.disconnect()
-  }, [])
+  }, [invalidate])
 
   // Render loop.
   useEffect(() => {
     let raf = 0
 
-    const loop = () => {
-      if (dirtyRef.current) {
-        dirtyRef.current = false
+    // Event-driven: no frames are scheduled while idle. Anything that changes
+    // the view calls invalidate(); a draw that's still animating reschedules.
+    const schedule = () => {
+      if (!raf) {
+        raf = requestAnimationFrame(frame)
+      }
+    }
 
-        if (draw()) {
-          dirtyRef.current = true
-        }
+    const frame = () => {
+      raf = 0
+
+      if (!dirtyRef.current) {
+        return
       }
 
-      raf = requestAnimationFrame(loop)
+      // A draw that's still animating (orbs, fades) keeps the loop alive
+      // seamlessly; otherwise we settle to idle.
+      dirtyRef.current = draw()
+
+      if (dirtyRef.current) {
+        schedule()
+      }
+    }
+
+    invalidateRef.current = () => {
+      dirtyRef.current = true
+      schedule()
     }
 
     const draw = () => {
@@ -512,7 +728,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           return targetAlpha
         }
 
-        const rate = targetAlpha > prev ? 0.08 : 0.32
+        const rate = targetAlpha > prev ? 0.22 : 0.32
         const next = prev + (targetAlpha - prev) * rate
 
         if (Math.abs(next - targetAlpha) < 0.01) {
@@ -527,60 +743,28 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         return next
       }
 
-      // Unified focus precedence (nodes and rings behave 1:1): a SELECTED item
-      // locks the view; hover only applies when nothing is selected; node-focus
-      // and ring-focus are mutually exclusive, so hovering one kind while the
-      // other is selected never switches the highlight (tooltip still shows).
-      let focus: null | string = null
-      let focusRing: null | number = null
-
-      if (selectedIdRef.current) {
-        focus = selectedIdRef.current
-      } else if (selectedRingRef.current != null) {
-        focusRing = selectedRingRef.current
-      } else if (hoverRef.current) {
-        focus = hoverRef.current
-      } else if (hoveredRingRef.current != null) {
-        focusRing = hoveredRingRef.current
-      }
-
+      // Two independent layers that compose: a node highlight (selected node,
+      // else hovered) painted in full ink, and a ring/date filter (selected
+      // ring, else hovered) that only shifts alpha. A date can stay selected
+      // while you focus nodes inside it.
+      const focus = selectedIdRef.current ?? hoverRef.current
+      // Rings respond to SELECTION only — hover does nothing (no neighbor bleed).
+      const focusRing = selectedRingRef.current
       const focusSet = focus ? (adj.get(focus) ?? new Set<string>()) : null
 
       // Tilted projection: y is squashed for the "looking down at a disk" feel.
       const projX = (wx: number) => wx * vp.k + vp.x
       const projY = (wy: number) => wy * vp.k * TILT + vp.y
 
-      // Structure stays pure foreground; node/route accents derive from the
-      // active desktop theme.
-      const style = getComputedStyle(canvas)
-      const fg = resolveRgb(style.color)
-      const darkTheme = luminance(fg.r, fg.g, fg.b) > 0.55
-      const base = darkTheme ? { b: 255, g: 255, r: 255 } : { b: 0, g: 0, r: 0 }
+      // Theme palette is resolved only when the theme changes (the resolveRgb
+      // probe is a getImageData readback), then reused every frame.
+      if (themeDirtyRef.current || !paletteRef.current) {
+        paletteRef.current = computePalette(canvas)
+        themeDirtyRef.current = false
+      }
+
+      const { bandInk, base, bg, c, chipBg, darkTheme, inkInv, memoryInk, skillInk } = paletteRef.current
       const shade = (a: number) => `rgba(${base.r},${base.g},${base.b},${a})`
-      const c = MODE_DEFAULTS[darkTheme ? 'dark' : 'light']
-
-      const primary = resolveRgb(style.getPropertyValue('--theme-primary').trim() || style.color)
-
-      const secondary = resolveRgb(
-        style.getPropertyValue('--theme-secondary').trim() ||
-          style.getPropertyValue('--theme-midground').trim() ||
-          style.color
-      )
-
-      const skillInk = mixRgb(primary, base, darkTheme ? 0.12 : 0.18)
-      const memoryInk = mixRgb(secondary, base, darkTheme ? 0.08 : 0.14)
-      const chipBg = darkTheme ? 'rgba(0,0,0,0.72)' : 'rgba(255,255,255,0.85)'
-
-      // Actual overlay surface color — used as a label backdrop so text stays
-      // legible over rings/links without a stark black/white halo.
-      const bg = resolveRgb(
-        style.getPropertyValue('--background').trim() ||
-          style.getPropertyValue('--dt-background').trim() ||
-          (darkTheme ? '#000' : '#fff')
-      )
-
-      // Inverted ink (background color) for the flipped focused tooltip.
-      const inkInv = darkTheme ? 'rgba(0,0,0,1)' : 'rgba(255,255,255,1)'
 
       const recencyInk = (rec: number) => {
         const reach = Math.max(0.01, AGE_GRADIENT.reach)
@@ -620,13 +804,52 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
       const ringIdx = focusRing
       const ring = ringIdx != null ? (ringsRef.current[ringIdx] ?? null) : null
-      const active = !!focus || !!ring
+      // The "lit" date = hovered (preview) or selected (locked). Drives only the
+      // band flatten; the ring outline never changes.
+      const hoverRingIdx = hoveredRingRef.current
+      const litRingIdx = hoverRingIdx ?? ringIdx
+      const rings = ringsRef.current
+      const { bandAlpha, lightSize, ringAlpha, sheen } = RING_PARAMS[darkTheme ? 'dark' : 'light']
+
+      // Inter-ring bands: normally a theme-tinted wash sliver at the outer edge;
+      // the lit date flattens the band just inside it to a constant light wash.
+      if (bandAlpha > 0 || litRingIdx != null) {
+        for (let i = 0; i < rings.length - 1; i += 1) {
+          const lit = litRingIdx != null && i + 1 === litRingIdx
+
+          if (!lit && bandAlpha <= 0) {
+            continue
+          }
+
+          const inner = rings[i]?.r ?? 0
+          const outer = rings[i + 1]?.r ?? 0
+
+          if (lit) {
+            // Lit date: flat, even wash across the whole band.
+            ctx.fillStyle = rgba(bandInk, LIT_BAND_ALPHA)
+          } else {
+            const grad = ctx.createRadialGradient(0, 0, inner, 0, 0, outer)
+            grad.addColorStop(0, rgba(bandInk, 0))
+            grad.addColorStop(clamp(1 - lightSize, 0.01, 0.99), rgba(bandInk, 0))
+            grad.addColorStop(1, rgba(bandInk, bandAlpha))
+            ctx.fillStyle = grad
+          }
+
+          ctx.beginPath()
+          ctx.arc(0, 0, outer, 0, Math.PI * 2)
+          ctx.arc(0, 0, inner, 0, Math.PI * 2, true)
+          ctx.fill()
+        }
+      }
+
+      // Ring outline: brightens only on FOCUS (selected date) — the selected
+      // ring plus its inner neighbor (the two bounding the lit band). No hover.
       ctx.lineWidth = c.ringWidth / vp.k
       ctx.setLineDash(c.ringDashed ? [c.ringDash / vp.k, c.ringDash / vp.k] : [])
       ringsRef.current.forEach((rg, i) => {
-        // Idle alpha is the slider; focus/hover derive emphasis from it.
-        const targetAlpha = ringIdx === i ? clamp(c.ringAlpha + 0.3, 0, 1) : active ? clamp(c.ringAlpha + 0.1, 0, 1) : c.ringAlpha
-        ctx.strokeStyle = shade(fadeAlpha(fades.rings, String(i), targetAlpha, ringIdx === i))
+        const emphasized = ringIdx != null && (i === ringIdx || i === ringIdx - 1)
+        const targetAlpha = emphasized ? clamp(LIT_BAND_ALPHA * 2, 0, 1) : ringAlpha
+        ctx.strokeStyle = shade(fadeAlpha(fades.rings, String(i), targetAlpha, emphasized))
         ctx.beginPath()
         ctx.arc(0, 0, rg.r, 0, Math.PI * 2)
         ctx.stroke()
@@ -668,15 +891,14 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           y2 += ((y1 - y2) / d) * focusRingR
         }
 
-        // Ambient links follow the recency slope; focused routes ignore age so
-        // selection stays readable.
+        // Ambient links follow the recency slope; a focused/hovered node's
+        // connectors go solid, 1.5px, fully opaque so the constellation pops.
         const ageInk = recencyInk((s.rec + t.rec) / 2)
-        // Ambient alpha is the slider (aged down); focused routes get emphasis.
-        const targetAlpha = lit ? clamp(c.lineAlpha + 0.45, 0, 1) : focus || ring ? 0.025 : ageInk * c.lineAlpha
+        const targetAlpha = lit ? 1 : focus || ring ? 0.025 : ageInk * c.lineAlpha
         const linkAlpha = fadeAlpha(fades.links, `${s.id}->${t.id}`, targetAlpha, lit)
         ctx.strokeStyle = shade(linkAlpha)
-        ctx.setLineDash(c.lineDashed ? [c.lineDash, c.lineDash] : [])
-        ctx.lineWidth = c.lineWidth
+        ctx.setLineDash(lit || !c.lineDashed ? [] : [c.lineDash, c.lineDash])
+        ctx.lineWidth = lit ? 1.5 : c.lineWidth
         ctx.beginPath()
         ctx.moveTo(x1, y1)
         ctx.lineTo(x2, y2)
@@ -685,35 +907,35 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
       ctx.setLineDash([])
 
-      // Systems (nodes): newest stays full ink, older content fades through the
-      // same smooth slope as links. Size still encodes usage/state.
+      // Systems (nodes). The node layer paints pure ink (focused node + its
+      // neighbors); the ring/date layer is alpha-only — selected-date nodes keep
+      // their tint and just brighten, so the two states compose cleanly.
       for (const n of nodes) {
         const isFocus = n.id === focus
         const isNeighbor = !!focusSet && focusSet.has(n.id)
         const inRing = !!ring && Math.abs(n.rec - ring.ratio) <= 0.13
-        const dim = focus ? !isFocus && !isNeighbor : ring ? !inRing : false
+        const nodeHigh = isFocus || isNeighbor
         const ageInk = recencyInk(n.rec)
-        const ageScale = isFocus || isNeighbor || inRing ? 1 : 0.34 + Math.min(1, n.rec / 0.4) * 0.66
+        const ageScale = nodeHigh || inRing ? 1 : 0.34 + Math.min(1, n.rec / 0.4) * 0.66
         const r = nodeRadius(n) * vp.k * ageScale
         const sx = projX(n.x)
         const sy = projY(n.y)
 
-        const targetAlpha = dim ? 0.16 : isFocus || isNeighbor || inRing ? 1 : ageInk
-        ctx.globalAlpha = fadeAlpha(fades.nodes, n.id, targetAlpha, isFocus || isNeighbor || inRing)
-        const nodeInk = n.kind === 'memory' ? memoryInk : skillInk
-        ctx.fillStyle = rgba(nodeInk, 1)
+        // Alpha: node highlight wins; otherwise the date filter (in-ring bright,
+        // off-ring dim, and a mid level for in-ring while a node is focused).
+        const targetAlpha = nodeHigh ? 1 : ring ? (inRing ? (focus ? 0.55 : 1) : 0.16) : focus ? 0.16 : ageInk
+        ctx.globalAlpha = fadeAlpha(fades.nodes, n.id, targetAlpha, nodeHigh || inRing)
+        // Pure ink only for the node layer; the date filter never recolors.
+        const nodeInk = nodeHigh ? base : n.kind === 'memory' ? memoryInk : skillInk
+        const shape = NODE_SHAPE[n.kind]
+        shapePath(ctx, shape, sx, sy, r)
 
-        if (n.kind === 'memory') {
-          ctx.beginPath()
-          ctx.moveTo(sx, sy - r)
-          ctx.lineTo(sx + r, sy)
-          ctx.lineTo(sx, sy + r)
-          ctx.lineTo(sx - r, sy)
-          ctx.closePath()
-          ctx.fill()
+        if (shape === 'circle') {
+          // Active/hover (highlighted) orbs pop full bright; others darken so the
+          // sheen reads against a brighter primary.
+          sphereFill(ctx, sx, sy, r, nodeInk, sheen, nodeHigh ? 0 : ORB_DARKEN)
         } else {
-          ctx.beginPath()
-          ctx.arc(sx, sy, r, 0, Math.PI * 2)
+          ctx.fillStyle = rgba(nodeInk, 1)
           ctx.fill()
         }
 
@@ -721,8 +943,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           ctx.globalAlpha = 1
           ctx.strokeStyle = rgba(nodeInk, 1)
           ctx.lineWidth = 1.4
-          ctx.beginPath()
-          ctx.arc(sx, sy, r + 4, 0, Math.PI * 2)
+          shapePath(ctx, shape, sx, sy, r + 4)
           ctx.stroke()
         }
       }
@@ -749,9 +970,8 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
         const tw = ctx.measureText(rg.label).width
         const boxW = tw + 6
-        // Any focus (a node OR another date) fades the non-focused dates —
-        // label and bg together.
-        const isThis = ringIdx === i
+        // The selected OR hovered date is "this"; any focus fades the rest.
+        const isThis = ringIdx === i || hoverRingIdx === i
         const faded = (focus != null || ringIdx != null) && !isThis
         // EVE-style: labels float in space (no chip). A solid backdrop in the
         // overlay's own background color masks the ring line behind the text so
@@ -759,39 +979,17 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         ctx.globalAlpha = fadeAlpha(fades.labels, String(i), faded ? 0.33 : 1, isThis)
         ctx.fillStyle = rgba(bg, 1)
         ctx.fillRect(sx - boxW / 2, sy - 6, boxW, 13)
-        ctx.fillStyle = shade(isThis ? 1 : 0.55)
+        ctx.fillStyle = shade(isThis ? 1 : 0.2)
         ctx.fillText(rg.label, sx, sy + 3)
         ctx.globalAlpha = 1
         ringLabelRectsRef.current.push({ h: 18, i, w: boxW + 6, x: sx - boxW / 2 - 3, y: sy - 10 })
       })
 
-      // Constellation labels for the focus + its neighbors (name only).
-      ctx.font = '11px ui-sans-serif, system-ui, sans-serif'
-
-      for (const id of focusSet ?? []) {
-        if (id === hoverRef.current) {
-          continue
-        }
-
-        const n = byId.get(id)
-
-        if (!n) {
-          continue
-        }
-
-        const sx = projX(n.x)
-        const sy = projY(n.y) - (nodeRadius(n) * vp.k + 7)
-        const tw = ctx.measureText(n.label).width
-        ctx.fillStyle = chipBg
-        ctx.fillRect(sx - tw / 2 - 4, sy - 11, tw + 8, 15)
-        ctx.fillStyle = shade(0.85)
-        ctx.fillText(n.label, sx, sy)
-      }
-
-      // Tooltip on focus (hover OR selection). The metabar and the title each
-      // get their own background that fills to their own width — no shared box,
-      // so a long title never leaves blank gaps in the metabar.
+      // Tooltip on focus (hover OR selection) — drawn first so its rect joins
+      // the avoidance set and neighbor labels route around it. The metabar and
+      // the title each get their own background that fills to their own width.
       const tip = focus ? byId.get(focus) : null
+      let tipRect: null | Rect = null
 
       if (tip) {
         const PADX = 6
@@ -845,6 +1043,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         const totalH = BADGE_H + ROW_GAP + titleBgH + (footerText ? ROW_GAP + FOOTER_H : 0)
         const bx = clamp(projX(tip.x) - totalW / 2, 4, Math.max(4, w - totalW - 4))
         const by = clamp(projY(tip.y) - (nodeRadius(tip) * vp.k + 8) - totalH, 4, Math.max(4, h - totalH - 4))
+        tipRect = { h: totalH, w: totalW, x: bx, y: by }
 
         const textX = bx + PADX
 
@@ -888,12 +1087,74 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         ctx.textBaseline = 'alphabetic'
       }
 
+      // Constellation labels for the focus's neighbors — greedy placement that
+      // clamps to the overlay and dodges already-placed labels (date labels and
+      // the tooltip included) so they don't overlap or clip at the edges.
+      ctx.font = '11px ui-sans-serif, system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      const LBL_M = 6
+      const LBL_H = 15
+      const placed = ringLabelRectsRef.current.map(r => ({ h: r.h, w: r.w, x: r.x, y: r.y }))
+      const hits = (a: Rect, b: Rect) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+
+      if (tipRect) {
+        placed.push(tipRect)
+      }
+
+      for (const id of focusSet ?? []) {
+        if (id === hoverRef.current) {
+          continue
+        }
+
+        const n = byId.get(id)
+
+        if (!n) {
+          continue
+        }
+
+        const label = ellipsize(ctx, n.label, Math.min(180, w * 0.32))
+        const bw = ctx.measureText(label).width + 8
+        const x = clamp(projX(n.x) - bw / 2, LBL_M, Math.max(LBL_M, w - bw - LBL_M))
+        const top = projY(n.y) - (nodeRadius(n) * vp.k + 7) - LBL_H + 4
+        const clampY = (v: number) => clamp(v, LBL_M, Math.max(LBL_M, h - LBL_H - LBL_M))
+        // Prefer above the node, then fan outward; skip if nothing stays clear
+        // (a label on the tooltip reads worse than no label).
+        const step = LBL_H + 3
+        let y: null | number = null
+
+        for (let k = 0; k <= 7 && y == null; k += 1) {
+          for (const dy of k === 0 ? [0] : [-k * step, k * step]) {
+            const cand = { h: LBL_H, w: bw, x, y: clampY(top + dy) }
+
+            if (!placed.some(p => hits(cand, p))) {
+              y = cand.y
+
+              break
+            }
+          }
+        }
+
+        if (y == null) {
+          continue
+        }
+
+        placed.push({ h: LBL_H, w: bw, x, y })
+        ctx.fillStyle = chipBg
+        ctx.fillRect(x, y, bw, LBL_H)
+        ctx.fillStyle = shade(0.85)
+        ctx.fillText(label, x + bw / 2, y + 11)
+      }
+
       return animating
     }
 
-    raf = requestAnimationFrame(loop)
+    schedule()
 
-    return () => cancelAnimationFrame(raf)
+    return () => {
+      cancelAnimationFrame(raf)
+
+      invalidateRef.current = () => {}
+    }
   }, [])
 
   // Size the backing canvas (DPR-aware).
@@ -909,8 +1170,8 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       canvas.style.height = `${size.h}px`
     }
 
-    dirtyRef.current = true
-  }, [size])
+    invalidate()
+  }, [invalidate, size])
 
   // ── Interactions (invert the tilted projection for hit-testing) ───────────
   const pickNode = (cssX: number, cssY: number): null | SimNode => {
@@ -982,13 +1243,13 @@ function StarMap({ graph }: { graph: LearningGraph }) {
       if (id !== hoverRef.current || ringHit !== hoveredRingRef.current) {
         hoverRef.current = id
         hoveredRingRef.current = ringHit
-        dirtyRef.current = true
+        invalidate()
       }
 
       const canvas = canvasRef.current
 
       if (canvas) {
-        canvas.style.cursor = id || ringHit != null ? 'pointer' : 'grab'
+        canvas.style.cursor = id || ringHit != null ? 'pointer' : 'crosshair'
       }
 
       return
@@ -1003,7 +1264,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
 
     if (drag.mode === 'pan') {
       viewportRef.current = { ...drag.vp, x: drag.vp.x + dx, y: drag.vp.y + dy }
-      dirtyRef.current = true
+      invalidate()
     }
   }
 
@@ -1021,18 +1282,18 @@ function StarMap({ graph }: { graph: LearningGraph }) {
         return
       }
 
+      // Independent toggles: a date and a node can both be selected. Clicking
+      // empty space clears both.
       if (drag.ring != null) {
         selectedRingRef.current = selectedRingRef.current === drag.ring ? null : drag.ring
-        setSelectedId(null)
       } else if (drag.id) {
-        selectedRingRef.current = null
         setSelectedId(prev => (prev === drag.id ? null : drag.id))
       } else {
         selectedRingRef.current = null
         setSelectedId(null)
       }
 
-      dirtyRef.current = true
+      invalidate()
     }
 
     dragRef.current = { id: null, mode: 'none', moved: false, ring: null, sx: 0, sy: 0, vp: viewportRef.current }
@@ -1041,7 +1302,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
   const onMouseLeave = () => {
     hoverRef.current = null
     hoveredRingRef.current = null
-    dirtyRef.current = true
+    invalidate()
     endDrag()
   }
 
@@ -1065,20 +1326,20 @@ function StarMap({ graph }: { graph: LearningGraph }) {
     const vp = viewportRef.current
     const k = clamp(vp.k * (e.deltaY > 0 ? 0.9 : 1.1), ZOOM_MIN, ZOOM_MAX)
     viewportRef.current = { k, x: px - ((px - vp.x) / vp.k) * k, y: py - ((py - vp.y) / vp.k) * k }
-    dirtyRef.current = true
+    invalidate()
   }
 
   const resetView = () => {
     viewportRef.current = fitViewport(sizeRef.current.w, sizeRef.current.h)
     selectedRingRef.current = null
-    dirtyRef.current = true
+    invalidate()
     setSelectedId(null)
   }
 
   return (
     <div className="relative min-h-0 flex-1 overflow-hidden" ref={wrapRef}>
       <canvas
-        className="block touch-none select-none text-foreground"
+        className="block cursor-crosshair touch-none select-none text-foreground"
         onDoubleClick={resetView}
         onMouseDown={onMouseDown}
         onMouseLeave={onMouseLeave}
@@ -1113,6 +1374,7 @@ function StarMap({ graph }: { graph: LearningGraph }) {
           {loading ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
+
     </div>
   )
 }
@@ -1139,10 +1401,7 @@ export function LearningView({ onClose }: { onClose: () => void }) {
         <PanelEmpty description={error} icon="warning" title={t.learning.loadFailed} />
       ) : !graph && loading ? (
         <div aria-label={t.learning.loading} className="grid flex-1 place-items-center" role="status">
-          <div className="flex flex-col items-center gap-3">
-            <Loader className="size-12 text-muted-foreground" strokeScale={0.72} type="spiral-search" />
-            <span className="text-xs text-muted-foreground/70">{t.learning.loading}</span>
-          </div>
+          <Loader className="size-12 text-muted-foreground" strokeScale={0.72} type="spiral-search" />
         </div>
       ) : graph && graph.nodes.length === 0 ? (
         <PanelEmpty description={t.learning.emptyDesc} icon="lightbulb" title={t.learning.emptyTitle} />

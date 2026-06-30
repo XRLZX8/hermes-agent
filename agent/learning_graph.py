@@ -167,7 +167,7 @@ def _memory_cards() -> list[dict[str, Any]]:
     """Freeform memory as readable cards.
 
     ``MEMORY.md`` / ``USER.md`` are prose split on bare ``§`` separators; each
-    chunk becomes one card. Bounded so a huge memory file can't flood the panel.
+    chunk becomes one card. Every chunk is surfaced — the graph shows everything.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -196,7 +196,7 @@ def _memory_cards() -> list[dict[str, Any]]:
                     "body": chunk[:1200],
                 }
             )
-    return cards[:60]
+    return cards
 
 
 def _tokenize(text: str) -> set[str]:
