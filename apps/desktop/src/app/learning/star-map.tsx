@@ -8,7 +8,7 @@ import type { LearningGraph } from '@/types/hermes'
 
 import { computePalette } from './color'
 import { TILT, ZOOM_MAX, ZOOM_MIN } from './constants'
-import { clamp, fitViewport, hash, nodeRadius } from './geometry'
+import { clamp, distToSegmentSq, fitViewport, hash, nodeRadius } from './geometry'
 import { drawScene } from './render'
 import { buildSimulation } from './simulation'
 import type { FadeBuckets, MemoryCard, Palette, Ring, RingLabelRect, SimLink, SimNode, Star, Viewport } from './types'
@@ -43,6 +43,7 @@ export function StarMap({ graph }: { graph: LearningGraph }) {
   const invalidateRef = useRef<() => void>(() => {})
   const viewportRef = useRef<Viewport>({ k: 1, x: 0, y: 0 })
   const hoverRef = useRef<null | string>(null)
+  const hoveredLinkRef = useRef<null | string>(null)
   const hoveredRingRef = useRef<null | number>(null)
   const selectedRingRef = useRef<null | number>(null)
   const selectedIdRef = useRef<null | string>(null)
@@ -214,6 +215,7 @@ export function StarMap({ graph }: { graph: LearningGraph }) {
         fades: fadeRef.current,
         focusId: selectedIdRef.current ?? hoverRef.current,
         hoverId: hoverRef.current,
+        hoverLink: hoveredLinkRef.current,
         hoverRing: hoveredRingRef.current,
         links: linksRef.current,
         memById: memByIdRef.current,
@@ -296,6 +298,38 @@ export function StarMap({ graph }: { graph: LearningGraph }) {
     return best
   }
 
+  // Nearest link within ~5px of the cursor (screen space), or null.
+  const pickLink = (cssX: number, cssY: number): null | string => {
+    const vp = viewportRef.current
+    let best: null | string = null
+    let bestD = 25
+
+    for (const link of linksRef.current) {
+      const s = typeof link.source === 'object' ? link.source : byIdRef.current.get(String(link.source))
+      const t = typeof link.target === 'object' ? link.target : byIdRef.current.get(String(link.target))
+
+      if (!s || !t) {
+        continue
+      }
+
+      const d = distToSegmentSq(
+        cssX,
+        cssY,
+        s.x * vp.k + vp.x,
+        s.y * vp.k * TILT + vp.y,
+        t.x * vp.k + vp.x,
+        t.y * vp.k * TILT + vp.y
+      )
+
+      if (d < bestD) {
+        bestD = d
+        best = `${s.id}->${t.id}`
+      }
+    }
+
+    return best
+  }
+
   const pickRingLabel = (cssX: number, cssY: number): null | number => {
     for (const r of ringLabelRectsRef.current) {
       if (cssX >= r.x && cssX <= r.x + r.w && cssY >= r.y && cssY <= r.y + r.h) {
@@ -340,10 +374,13 @@ export function StarMap({ graph }: { graph: LearningGraph }) {
       const { x, y } = localXY(e)
       const ringHit = pickRingLabel(x, y)
       const id = ringHit == null ? (pickNode(x, y)?.id ?? null) : null
+      // Links are the last fallback (only when not over a node/date).
+      const linkKey = ringHit == null && id == null ? pickLink(x, y) : null
 
-      if (id !== hoverRef.current || ringHit !== hoveredRingRef.current) {
+      if (id !== hoverRef.current || ringHit !== hoveredRingRef.current || linkKey !== hoveredLinkRef.current) {
         hoverRef.current = id
         hoveredRingRef.current = ringHit
+        hoveredLinkRef.current = linkKey
         invalidate()
       }
 
@@ -401,6 +438,7 @@ export function StarMap({ graph }: { graph: LearningGraph }) {
   const onMouseLeave = () => {
     hoverRef.current = null
     hoveredRingRef.current = null
+    hoveredLinkRef.current = null
     invalidate()
     endDrag()
   }

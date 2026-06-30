@@ -12,6 +12,7 @@ export interface Scene {
   fades: FadeBuckets
   focusId: null | string
   hoverId: null | string
+  hoverLink: null | string
   hoverRing: null | number
   links: SimLink[]
   memById: Map<string, MemoryCard>
@@ -56,7 +57,7 @@ const rectsOverlap = (a: Rect, b: Rect) => a.x < b.x + b.w && a.x + a.w > b.x &&
 // canvas + advances the fade buckets); returns whether it's still animating and
 // the ring-label hit rects for pointer picking.
 export function drawScene(scene: Scene): DrawResult {
-  const { adjacency, byId, ctx, dpr, fades, focusId, hoverId, hoverRing, links, memById, nodes, palette, rings, selectedRing, size, stars, vp } = scene
+  const { adjacency, byId, ctx, dpr, fades, focusId, hoverId, hoverLink, hoverRing, links, memById, nodes, palette, rings, selectedRing, size, stars, vp } = scene
   const { h, w } = size
   const { bandInk, base, bg, c, chipBg, darkTheme, inkInv, memoryInk, skillInk } = palette
   const { bandAlpha, lightSize, ringAlpha, sheen } = RING_PARAMS[darkTheme ? 'dark' : 'light']
@@ -200,9 +201,11 @@ export function drawScene(scene: Scene): DrawResult {
       y2 += ((y1 - y2) / d) * focusRingR
     }
 
-    const ageInk = recencyInk((s.rec + t.rec) / 2)
-    const targetAlpha = lit ? 1 : focusId || ring ? 0.025 : ageInk * c.lineAlpha
-    const linkAlpha = fadeAlpha(fades.links, `${s.id}->${t.id}`, targetAlpha, lit)
+    const key = `${s.id}->${t.id}`
+    const ambient = recencyInk((s.rec + t.rec) / 2) * c.lineAlpha
+    // Hovering a line fades it in a bit (×2, capped — never full white).
+    const targetAlpha = lit ? 1 : key === hoverLink ? clamp(ambient * 2, 0, 0.7) : focusId || ring ? 0.025 : ambient
+    const linkAlpha = fadeAlpha(fades.links, key, targetAlpha, lit)
     ctx.strokeStyle = shade(linkAlpha)
     ctx.setLineDash(lit || !c.lineDashed ? [] : [c.lineDash, c.lineDash])
     ctx.lineWidth = lit ? 1.5 : c.lineWidth

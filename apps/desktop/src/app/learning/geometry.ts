@@ -98,3 +98,15 @@ export function fitViewport(w: number, h: number): Viewport {
 export function radiusForRecency(rec: number): number {
   return RING_INNER + rec * (RING_OUTER - RING_INNER)
 }
+
+// Squared distance from point (px,py) to segment a→b — for cheap link hit-tests.
+export function distToSegmentSq(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const dx = bx - ax
+  const dy = by - ay
+  const len = dx * dx + dy * dy
+  const t = len ? clamp(((px - ax) * dx + (py - ay) * dy) / len, 0, 1) : 0
+  const cx = ax + dx * t
+  const cy = ay + dy * t
+
+  return (px - cx) ** 2 + (py - cy) ** 2
+}
